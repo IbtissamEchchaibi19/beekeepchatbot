@@ -9,6 +9,8 @@ langchain-groq
 sentence-transformers
 pinecone-client
 transformers
-torch==2.4.1+cpu --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision 
+torchaudio
 numpy
 pandas
