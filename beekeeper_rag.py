@@ -804,11 +804,7 @@ def create_gradio_interface(chatbot):
         </div>
     </div>
     """)
-        
-        
-        # Chat container
         with gr.Column(elem_classes="chat-container"):
-            # Chatbot component
             chatbot_component = gr.Chatbot(
                 value=[],
                 height=450,
