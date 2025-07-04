@@ -10,7 +10,5 @@ sentence-transformers
 pinecone-client
 transformers
 torch
-torchvision 
-torchaudio
 numpy
 pandas
