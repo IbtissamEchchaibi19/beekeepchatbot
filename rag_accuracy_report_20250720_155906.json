@@ -1,0 +1,16 @@
+{
+  "summary": {
+    "overall_accuracy": 0.8,
+    "factual_accuracy": 0.8,
+    "grounding_accuracy": 0.8,
+    "relevance_accuracy": 0.8,
+    "total_questions": 5,
+    "correct_answers": 4
+  },
+  "detailed_scores": [
+    {
+      "factual_accuracy": 1.0,
+      "grounding_accuracy": 1.0,
+      "relevance_accuracy": 1.0,
+      "overall_accuracy": 1.0,
+      "is_correct": 

@@ -1,514 +1,607 @@
+"""
+RAG Evaluation Module
+Author: Your Name
+Description: Comprehensive evaluation framework for RAG systems
+"""
+
 import os
 import json
-import uuid
-from typing import List, Dict, Optional, Tuple
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Any
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+import pandas as pd
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferWindowMemory
-from pinecone import Pinecone, ServerlessSpec
+import re
+from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import statistics
 
-load_dotenv()
+@dataclass
+class EvaluationMetrics:
+    """Data class to store comprehensive evaluation metrics"""
+    question: str
+    generated_answer: str
+    reference_answer: Optional[str] = None
+    retrieved_contexts: List[str] = None
+    
+    # Accuracy Metrics (0.0 - 1.0)
+    semantic_similarity: float = 0.0
+    factual_accuracy: float = 0.0
+    answer_relevance: float = 0.0
+    
+    # Quality Metrics (0.0 - 1.0)
+    completeness: float = 0.0
+    clarity: float = 0.0
+    coherence: float = 0.0
+    
+    # Conformity Metrics (0.0 - 1.0)
+    context_adherence: float = 0.0
+    hallucination_score: float = 0.0  # 0.0 = no hallucination, 1.0 = high hallucination
+    knowledge_base_alignment: float = 0.0
+    
+    # Retrieval Metrics (0.0 - 1.0)
+    context_precision: float = 0.0
+    context_recall: float = 0.0
+    retrieval_quality: float = 0.0
+    
+    # Overall Scores
+    accuracy_score: float = 0.0
+    quality_score: float = 0.0
+    conformity_score: float = 0.0
+    overall_score: float = 0.0
+    
+    # Metadata
+    evaluation_timestamp: str = None
+    confidence_level: str = "medium"
+    
+    def __post_init__(self):
+        if self.evaluation_timestamp is None:
+            self.evaluation_timestamp = datetime.now().isoformat()
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for easy serialization"""
+        return asdict(self)
 
-# Pydantic models for API
-class ChatMessage(BaseModel):
-    message: str = Field(..., description="User's message/question")
-    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
-
-class ChatResponse(BaseModel):
-    response: str = Field(..., description="Bot's response")
-    session_id: str = Field(..., description="Session ID for this conversation")
-    confidence: float = Field(..., description="Confidence score (0.0-1.0)")
-    is_expert_knowledge: bool = Field(..., description="Whether response is from expert knowledge base")
-    timestamp: datetime = Field(..., description="Response timestamp")
-
-class SessionInfo(BaseModel):
-    session_id: str = Field(..., description="Session ID")
-    message_count: int = Field(..., description="Number of messages in this session")
-    created_at: datetime = Field(..., description="Session creation time")
-    last_activity: datetime = Field(..., description="Last activity time")
-
-class HealthResponse(BaseModel):
-    status: str = Field(..., description="Service health status")
-    version: str = Field(..., description="API version")
-    components: Dict[str, str] = Field(..., description="Component status")
-
-# FastAPI app
-app = FastAPI(
-    title="Honey Expert Chatbot API",
-    description="API for honey industry expert chatbot with beekeeping knowledge",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class HoneyExpertChatbot:
-    def __init__(self, pinecone_api_key: str, groq_api_key: str, pinecone_environment: str = "us-east-1-aws"):
-        self.pinecone_api_key = pinecone_api_key
-        self.groq_api_key = groq_api_key
-        self.pinecone_environment = pinecone_environment
-        self.similarity_threshold = 0.3
+class RAGEvaluator:
+    """Comprehensive RAG evaluation system"""
+    
+    def __init__(self, llm: ChatGroq, debug: bool = False):
+        """
+        Initialize the RAG evaluator
         
-        # Initialize embeddings
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
+        Args:
+            llm: ChatGroq language model instance
+            debug: Enable debug mode for verbose output
+        """
+        self.llm = llm
+        self.debug = debug
+        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+        
+        # Evaluation templates
+        self._init_templates()
+    
+    def _init_templates(self):
+        """Initialize evaluation prompt templates"""
+        
+        self.factual_accuracy_template = PromptTemplate(
+            template="""You are an expert fact-checker for beekeeping and honey production knowledge.
+
+Generated Answer: {generated_answer}
+
+Source Contexts: {contexts}
+
+Task: Rate the factual accuracy of the generated answer against the source contexts.
+
+Evaluation Criteria:
+- 1.0: All facts are accurate and properly supported
+- 0.8: Mostly accurate with minor issues  
+- 0.6: Generally accurate but some notable errors
+- 0.4: Mixed accuracy with significant errors
+- 0.2: Mostly inaccurate information
+- 0.0: Completely inaccurate or unsupported
+
+Return only a decimal number (0.0-1.0):""",
+            input_variables=["generated_answer", "contexts"]
         )
         
-        # Initialize Groq LLM
-        self.llm = ChatGroq(
-            groq_api_key=groq_api_key,
-            model_name="llama3-70b-8192",
-            temperature=0.1,
-            max_tokens=1000
+        self.relevance_template = PromptTemplate(
+            template="""Evaluate how well this answer addresses the specific question asked.
+
+Question: {question}
+Generated Answer: {generated_answer}
+
+Rate answer relevance (0.0-1.0):
+- 1.0: Directly and completely answers the question
+- 0.8: Good answer with minor irrelevance
+- 0.6: Partially answers the question
+- 0.4: Somewhat related but misses key points
+- 0.2: Barely addresses the question
+- 0.0: Completely irrelevant
+
+Return only a decimal number (0.0-1.0):""",
+            input_variables=["question", "generated_answer"]
         )
         
-        self.vector_store = None
-        self.qa_chain = None
+        self.completeness_template = PromptTemplate(
+            template="""Evaluate the completeness of this answer given the available information.
+
+Question: {question}
+Generated Answer: {generated_answer}
+Available Context: {contexts}
+
+Rate completeness (0.0-1.0):
+- 1.0: Comprehensive, covers all important aspects
+- 0.8: Good coverage with minor gaps
+- 0.6: Adequate but missing some key points
+- 0.4: Incomplete with notable gaps
+- 0.2: Very incomplete
+- 0.0: Severely incomplete or unhelpful
+
+Return only a decimal number (0.0-1.0):""",
+            input_variables=["question", "generated_answer", "contexts"]
+        )
         
-        # Store individual session memories and metadata
-        self.session_memories = {}
-        self.session_metadata = {}
+        self.context_adherence_template = PromptTemplate(
+            template="""Evaluate how well the answer sticks to information from the provided contexts.
+
+Generated Answer: {generated_answer}
+Source Contexts: {contexts}
+
+Rate context adherence (0.0-1.0):
+- 1.0: Answer uses only information from contexts
+- 0.8: Mostly from contexts with minimal external info
+- 0.6: Good use of contexts but some external information
+- 0.4: Mixed use of context and external knowledge
+- 0.2: Limited use of provided contexts
+- 0.0: Ignores contexts, uses mostly external information
+
+Return only a decimal number (0.0-1.0):""",
+            input_variables=["generated_answer", "contexts"]
+        )
         
-    def get_session_memory(self, session_id: str) -> ConversationBufferWindowMemory:
-        """Get or create memory for a specific session"""
-        if session_id not in self.session_memories:
-            self.session_memories[session_id] = ConversationBufferWindowMemory(
-                k=5,
-                memory_key="chat_history",
-                return_messages=True,
-                output_key="answer"
-            )
-            self.session_metadata[session_id] = {
-                "created_at": datetime.now(),
-                "last_activity": datetime.now(),
-                "message_count": 0
+        self.hallucination_template = PromptTemplate(
+            template="""Detect potential hallucinations in this answer compared to the source contexts.
+
+Generated Answer: {generated_answer}
+Source Contexts: {contexts}
+
+Rate hallucination level (0.0-1.0):
+- 0.0: No hallucinations, all information is supported
+- 0.2: Minor unsupported details
+- 0.4: Some notable unsupported claims
+- 0.6: Multiple unsupported or invented facts
+- 0.8: Significant fabricated information  
+- 1.0: Mostly hallucinated content
+
+Return only a decimal number (0.0-1.0):""",
+            input_variables=["generated_answer", "contexts"]
+        )
+    
+    def _extract_score(self, response_text: str, default: float = 0.0) -> float:
+        """Extract numerical score from LLM response"""
+        try:
+            # Look for decimal numbers
+            score_match = re.search(r'(\d+\.?\d*)', response_text.strip())
+            if score_match:
+                score = float(score_match.group(1))
+                return min(1.0, max(0.0, score))
+            return default
+        except Exception as e:
+            if self.debug:
+                print(f"Score extraction error: {e}")
+            return default
+    
+    def _safe_llm_call(self, template: PromptTemplate, **kwargs) -> float:
+        """Safely call LLM with error handling"""
+        try:
+            prompt = template.format(**kwargs)
+            response = self.llm.invoke(prompt)
+            return self._extract_score(response.content)
+        except Exception as e:
+            if self.debug:
+                print(f"LLM call error: {e}")
+            return 0.0
+    
+    def evaluate_semantic_similarity(self, generated: str, reference: str) -> float:
+        """Compute semantic similarity using TF-IDF cosine similarity"""
+        try:
+            if not reference or not generated:
+                return 0.0
+            
+            texts = [generated.lower(), reference.lower()]
+            tfidf_matrix = self.vectorizer.fit_transform(texts)
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            
+            return float(similarity)
+        except Exception as e:
+            if self.debug:
+                print(f"Semantic similarity error: {e}")
+            return 0.0
+    
+    def evaluate_factual_accuracy(self, generated: str, contexts: List[str]) -> float:
+        """Evaluate factual accuracy against source contexts"""
+        if not contexts:
+            return 0.0
+        
+        contexts_text = "\n---\n".join(contexts[:3])  # Limit context length
+        return self._safe_llm_call(
+            self.factual_accuracy_template,
+            generated_answer=generated,
+            contexts=contexts_text
+        )
+    
+    def evaluate_answer_relevance(self, question: str, generated: str) -> float:
+        """Evaluate answer relevance to the question"""
+        return self._safe_llm_call(
+            self.relevance_template,
+            question=question,
+            generated_answer=generated
+        )
+    
+    def evaluate_completeness(self, question: str, generated: str, contexts: List[str]) -> float:
+        """Evaluate answer completeness"""
+        contexts_text = "\n---\n".join(contexts[:3]) if contexts else "No context available"
+        return self._safe_llm_call(
+            self.completeness_template,
+            question=question,
+            generated_answer=generated,
+            contexts=contexts_text
+        )
+    
+    def evaluate_context_adherence(self, generated: str, contexts: List[str]) -> float:
+        """Evaluate how well answer adheres to provided contexts"""
+        if not contexts:
+            return 0.0
+        
+        contexts_text = "\n---\n".join(contexts[:3])
+        return self._safe_llm_call(
+            self.context_adherence_template,
+            generated_answer=generated,
+            contexts=contexts_text
+        )
+    
+    def evaluate_hallucination(self, generated: str, contexts: List[str]) -> float:
+        """Detect hallucinations in the generated answer"""
+        if not contexts:
+            return 1.0  # High hallucination if no context
+        
+        contexts_text = "\n---\n".join(contexts[:3])
+        return self._safe_llm_call(
+            self.hallucination_template,
+            generated_answer=generated,
+            contexts=contexts_text
+        )
+    
+    def evaluate_clarity_coherence(self, generated: str) -> Tuple[float, float]:
+        """Evaluate clarity and coherence using simple heuristics"""
+        try:
+            # Simple clarity metrics
+            sentences = generated.split('.')
+            avg_sentence_length = np.mean([len(s.split()) for s in sentences if s.strip()])
+            
+            # Normalize sentence length (ideal: 10-20 words)
+            clarity = 1.0 - min(1.0, abs(avg_sentence_length - 15) / 15)
+            
+            # Simple coherence: check for transition words and logical flow
+            transition_words = ['however', 'therefore', 'moreover', 'additionally', 'furthermore', 
+                             'consequently', 'meanwhile', 'similarly', 'in contrast', 'for example']
+            
+            transition_count = sum(1 for word in transition_words if word in generated.lower())
+            coherence = min(1.0, transition_count / max(1, len(sentences)))
+            
+            return max(0.0, clarity), max(0.0, coherence)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Clarity/coherence evaluation error: {e}")
+            return 0.5, 0.5  # Default moderate scores
+    
+    def evaluate_retrieval_quality(self, question: str, contexts: List[str], 
+                                 reference_contexts: Optional[List[str]] = None) -> Dict[str, float]:
+        """Evaluate retrieval quality metrics"""
+        try:
+            if not contexts:
+                return {"precision": 0.0, "recall": 0.0, "quality": 0.0}
+            
+            # Simple relevance check using keyword overlap
+            question_words = set(question.lower().split())
+            
+            relevant_contexts = 0
+            for context in contexts:
+                context_words = set(context.lower().split())
+                overlap = len(question_words.intersection(context_words))
+                if overlap >= 2:  # At least 2 words overlap
+                    relevant_contexts += 1
+            
+            precision = relevant_contexts / len(contexts) if contexts else 0.0
+            recall = 1.0 if relevant_contexts > 0 else 0.0  # Simplified recall
+            
+            # Overall retrieval quality
+            quality = (precision + recall) / 2 if (precision + recall) > 0 else 0.0
+            
+            return {
+                "precision": precision,
+                "recall": recall,
+                "quality": quality
             }
-        else:
-            self.session_metadata[session_id]["last_activity"] = datetime.now()
-        
-        return self.session_memories[session_id]
-    
-    def clear_session_memory(self, session_id: str):
-        """Clear memory for a specific session"""
-        if session_id in self.session_memories:
-            self.session_memories[session_id].clear()
-            self.session_metadata[session_id] = {
-                "created_at": datetime.now(),
-                "last_activity": datetime.now(),
-                "message_count": 0
-            }
-    
-    def get_session_info(self, session_id: str) -> Optional[Dict]:
-        """Get session information"""
-        if session_id in self.session_metadata:
-            return self.session_metadata[session_id]
-        return None
-    
-    def list_sessions(self) -> List[str]:
-        """List all active sessions"""
-        return list(self.session_memories.keys())
-        
-    def is_honey_related(self, question: str) -> bool:
-        """Use LLM to determine if question is honey/beekeeping related"""
-        try:
-            classification_prompt = f"""
-You are a domain classifier. Determine if the following question is related to honey production, beekeeping, apiculture, or bee-related topics.
-
-Question: "{question}"
-
-Answer with only "YES" if the question is about:
-- Honey production, harvesting, or processing
-- Beekeeping practices and techniques
-- Bee biology, behavior, or health
-- Hive management and equipment
-- Apiary setup and maintenance
-- Bee diseases, pests, or treatments
-- Pollination or bee ecology
-- Honey products (wax, royal jelly, propolis, etc.)
-- Honey recipes or culinary uses
-- Honey market trends or economics
-- Honey regulations or standards
-- Honey history or cultural significance
-- Honey-related research or innovations
-- Beekeeping education or training
-- Beekeeping community or events
-- Honey conservation or environmental impact
-- Honey sustainability practices
-- Honey and agriculture
-- Honey and nutrition
-- Honey verification or quality
-- Honey origins or sourcing
-- Honey and health benefits
-- Honey and wellness
-- Honey production methods or technologies
-
-Answer with only "NO" if the question is about unrelated topics.
-
-Answer: """
-            
-            response = self.llm.invoke(classification_prompt)
-            return response.content.strip().upper() == "YES"
-        except Exception as e:
-            print(f"Error in domain classification: {e}")
-            return False
-    
-    def check_index_stats(self, index_name: str) -> Dict:
-        """Check if index exists and has data"""
-        try:
-            pc = Pinecone(api_key=self.pinecone_api_key)
-            existing_indexes = pc.list_indexes().names()
-            
-            if index_name not in existing_indexes:
-                return {"exists": False, "vector_count": 0}
-            
-            index = pc.Index(index_name)
-            stats = index.describe_index_stats()
-            vector_count = stats.get('total_vector_count', 0)
-            
-            return {"exists": True, "vector_count": vector_count}
             
         except Exception as e:
-            print(f"Error checking index stats: {e}")
-            return {"exists": False, "vector_count": 0}
+            if self.debug:
+                print(f"Retrieval quality error: {e}")
+            return {"precision": 0.0, "recall": 0.0, "quality": 0.0}
     
-    def connect_to_existing_index(self, index_name: str = "honey-expert") -> bool:
-        """Connect to existing Pinecone index"""
-        try:
-            self.vector_store = PineconeVectorStore(
-                index_name=index_name,
-                embedding=self.embeddings,
-                pinecone_api_key=self.pinecone_api_key
+    def comprehensive_evaluate(self, question: str, generated_answer: str, 
+                             retrieved_contexts: List[str],
+                             reference_answer: Optional[str] = None,
+                             confidence_threshold: float = 0.7) -> EvaluationMetrics:
+        """
+        Perform comprehensive evaluation of RAG response
+        
+        Args:
+            question: The input question
+            generated_answer: RAG system's generated answer
+            retrieved_contexts: List of retrieved context documents
+            reference_answer: Optional ground truth answer
+            confidence_threshold: Threshold for determining confidence level
+            
+        Returns:
+            EvaluationMetrics object with all computed metrics
+        """
+        
+        if self.debug:
+            print(f"Evaluating question: {question[:50]}...")
+        
+        # Initialize metrics
+        metrics = EvaluationMetrics(
+            question=question,
+            generated_answer=generated_answer,
+            reference_answer=reference_answer,
+            retrieved_contexts=retrieved_contexts
+        )
+        
+        # 1. Accuracy Metrics
+        if reference_answer:
+            metrics.semantic_similarity = self.evaluate_semantic_similarity(
+                generated_answer, reference_answer
             )
-            return True
-        except Exception as e:
-            print(f"Error connecting to existing index: {e}")
-            return False
-    
-    def setup_vector_store(self, jsonl_data: Optional[List[Dict]] = None, index_name: str = "honey-expert", force_upload: bool = False):
-        """Setup Pinecone vector store with JSONL data"""
-        try:
-            index_stats = self.check_index_stats(index_name)
-            
-            if index_stats["exists"] and index_stats["vector_count"] > 0 and not force_upload:
-                print(f"Index '{index_name}' already exists with {index_stats['vector_count']} vectors.")
-                return self.connect_to_existing_index(index_name)
-            
-            if jsonl_data is None:
-                print("No data provided and index doesn't exist.")
-                return False
-            
-            pc = Pinecone(api_key=self.pinecone_api_key)
-            existing_indexes = pc.list_indexes().names()
-            
-            if index_name not in existing_indexes:
-                pc.create_index(
-                    name=index_name,
-                    dimension=384,
-                    metric="cosine",
-                    spec=ServerlessSpec(cloud="aws", region="us-east-1")
-                )
-            
-            # Process documents
-            documents = []
-            for item in jsonl_data:
-                instruction = item.get('instruction', '')
-                output = item.get('output', '')
-                input_text = item.get('input', '')
-                
-                content = f"Question: {instruction}\nAnswer: {output}"
-                if input_text:
-                    content += f"\nContext: {input_text}"
-                
-                if len(content) > 2000:
-                    content = content[:2000] + "..."
-                
-                doc = Document(
-                    page_content=content,
-                    metadata={
-                        "instruction": instruction[:500] if instruction else "",
-                        "output": output[:500] if output else "",
-                        "input": input_text[:500] if input_text else "",
-                        "source": "honey_expert_kb"
-                    }
-                )
-                documents.append(doc)
-            
-            # Upload in batches
-            batch_size = 100
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i+batch_size]
-                if i == 0:
-                    self.vector_store = PineconeVectorStore.from_documents(
-                        documents=batch,
-                        embedding=self.embeddings,
-                        index_name=index_name,
-                        pinecone_api_key=self.pinecone_api_key
-                    )
-                else:
-                    self.vector_store.add_documents(batch)
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error setting up vector store: {e}")
-            return False
-    
-    def create_custom_prompt(self):
-        """Create custom prompt template"""
-        template = """
-You are a honey industry expert with deep knowledge of beekeeping, honey production, and related topics.
-
-Context from Knowledge Base:
-{context}
-
-Previous Conversation:
-{chat_history}
-
-Current Question: {question}
-
-Instructions:
-1. Use conversation history for context
-2. Provide concise, practical answers
-3. Write in a natural, expert tone
-4. Reference previous discussions when relevant
-5. Keep responses focused and helpful
-
-Your response:
-"""
-        return PromptTemplate(
-            template=template,
-            input_variables=["context", "chat_history", "question"]
+        
+        metrics.factual_accuracy = self.evaluate_factual_accuracy(
+            generated_answer, retrieved_contexts
         )
-    
-    def create_non_domain_prompt(self):
-        """Create prompt for non-honey related questions"""
-        template = """
-You are a honey industry expert chatbot. The user asked about something outside honey/beekeeping topics.
-
-Previous Conversation:
-{chat_history}
-
-Current Question: {question}
-
-Politely redirect them to honey-related topics. Keep it brief and friendly.
-
-Your response:
-"""
-        return PromptTemplate(
-            template=template,
-            input_variables=["chat_history", "question"]
+        
+        metrics.answer_relevance = self.evaluate_answer_relevance(
+            question, generated_answer
         )
-    
-    def get_answer_with_confidence(self, question: str, session_id: str) -> Tuple[str, bool, float]:
-        """Get answer with confidence score"""
-        try:
-            session_memory = self.get_session_memory(session_id)
-            self.session_metadata[session_id]["message_count"] += 1
-            
-            is_domain_related = self.is_honey_related(question)
-            
-            if not is_domain_related:
-                non_domain_prompt = self.create_non_domain_prompt()
-                chat_history = session_memory.chat_memory.messages if hasattr(session_memory.chat_memory, 'messages') else []
-                
-                formatted_history = ""
-                if chat_history:
-                    for msg in chat_history[-4:]:
-                        if hasattr(msg, 'content'):
-                            role = "Human" if msg.type == "human" else "Assistant"
-                            formatted_history += f"{role}: {msg.content}\n"
-                
-                response = self.llm.invoke(non_domain_prompt.format(
-                    chat_history=formatted_history,
-                    question=question
-                ))
-                
-                session_memory.chat_memory.add_user_message(question)
-                session_memory.chat_memory.add_ai_message(response.content)
-                
-                return response.content, False, 0.0
-            
-            # Get similar documents with scores
-            docs_with_scores = self.vector_store.similarity_search_with_score(question, k=3)
-            
-            has_relevant_context = False
-            max_similarity = 0.0
-            
-            if docs_with_scores:
-                similarities = []
-                for doc, score in docs_with_scores:
-                    similarity = 1 - (score / 2)
-                    similarities.append(max(0, similarity))
-                
-                if similarities:
-                    max_similarity = max(similarities)
-                    has_relevant_context = max_similarity > self.similarity_threshold
-            
-            # Create conversational chain
-            temp_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=self.vector_store.as_retriever(search_kwargs={"k": 3}),
-                memory=session_memory,
-                combine_docs_chain_kwargs={"prompt": self.create_custom_prompt()},
-                return_source_documents=True,
-                verbose=False
-            )
-            
-            result = temp_chain.invoke({"question": question})
-            answer = result["answer"]
-            
-            return answer, has_relevant_context, max_similarity
-            
-        except Exception as e:
-            error_msg = f"Sorry, I encountered an error: {str(e)}. Please try rephrasing your question."
-            return error_msg, False, 0.0
-
-# Global chatbot instance
-chatbot = None
-
-def get_chatbot():
-    """Dependency to get chatbot instance"""
-    global chatbot
-    if chatbot is None:
-        raise HTTPException(status_code=500, detail="Chatbot not initialized")
-    return chatbot
-
-def load_jsonl_data(file_path: str) -> List[Dict]:
-    """Load JSONL data from file"""
-    data = []
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    data.append(json.loads(line.strip()))
-        return data
-    except Exception as e:
-        print(f"Error loading JSONL data: {e}")
-        return []
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize chatbot on startup"""
-    global chatbot
-    
-    # Get API keys from environment variables
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1-aws")
-    
-    if not PINECONE_API_KEY or not GROQ_API_KEY:
-        raise Exception("Please set PINECONE_API_KEY and GROQ_API_KEY environment variables")
-    
-    chatbot = HoneyExpertChatbot(PINECONE_API_KEY, GROQ_API_KEY, PINECONE_ENVIRONMENT)
-    
-    # Setup vector store
-    JSONL_FILE_PATH = "beekeeping_data.jsonl"
-    index_stats = chatbot.check_index_stats("honey-expert")
-    
-    if index_stats["exists"] and index_stats["vector_count"] > 0:
-        print(f"Connecting to existing index with {index_stats['vector_count']} vectors")
-        chatbot.setup_vector_store()
-    else:
-        print("Loading JSONL data for new index")
-        data = load_jsonl_data(JSONL_FILE_PATH)
-        if data:
-            chatbot.setup_vector_store(data)
+        
+        # 2. Quality Metrics
+        metrics.completeness = self.evaluate_completeness(
+            question, generated_answer, retrieved_contexts
+        )
+        
+        clarity, coherence = self.evaluate_clarity_coherence(generated_answer)
+        metrics.clarity = clarity
+        metrics.coherence = coherence
+        
+        # 3. Conformity Metrics
+        metrics.context_adherence = self.evaluate_context_adherence(
+            generated_answer, retrieved_contexts
+        )
+        
+        metrics.hallucination_score = self.evaluate_hallucination(
+            generated_answer, retrieved_contexts
+        )
+        
+        metrics.knowledge_base_alignment = (
+            metrics.context_adherence + (1.0 - metrics.hallucination_score)
+        ) / 2
+        
+        # 4. Retrieval Metrics
+        retrieval_scores = self.evaluate_retrieval_quality(question, retrieved_contexts)
+        metrics.context_precision = retrieval_scores["precision"]
+        metrics.context_recall = retrieval_scores["recall"]
+        metrics.retrieval_quality = retrieval_scores["quality"]
+        
+        # 5. Compute Overall Scores
+        metrics.accuracy_score = statistics.mean([
+            metrics.factual_accuracy,
+            metrics.answer_relevance,
+            metrics.semantic_similarity if reference_answer else 0.5
+        ])
+        
+        metrics.quality_score = statistics.mean([
+            metrics.completeness,
+            metrics.clarity,
+            metrics.coherence
+        ])
+        
+        metrics.conformity_score = statistics.mean([
+            metrics.context_adherence,
+            1.0 - metrics.hallucination_score,  # Invert hallucination
+            metrics.knowledge_base_alignment
+        ])
+        
+        # Overall score (weighted average)
+        weights = {
+            'accuracy': 0.4,
+            'quality': 0.3,
+            'conformity': 0.3
+        }
+        
+        metrics.overall_score = (
+            weights['accuracy'] * metrics.accuracy_score +
+            weights['quality'] * metrics.quality_score +
+            weights['conformity'] * metrics.conformity_score
+        )
+        
+        # Determine confidence level
+        if metrics.overall_score >= confidence_threshold:
+            metrics.confidence_level = "high"
+        elif metrics.overall_score >= confidence_threshold - 0.2:
+            metrics.confidence_level = "medium"
         else:
-            print("Warning: No data loaded, chatbot will work with general knowledge only")
+            metrics.confidence_level = "low"
+        
+        if self.debug:
+            print(f"Overall score: {metrics.overall_score:.3f} ({metrics.confidence_level} confidence)")
+        
+        return metrics
     
-    print("Honey Expert Chatbot API initialized successfully!")
-
-# API Routes
-@app.get("/", response_model=Dict[str, str])
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Honey Expert Chatbot API",
-        "version": "1.0.0",
-        "docs": "/docs"
-    }
-
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatMessage, chatbot: HoneyExpertChatbot = Depends(get_chatbot)):
-    """Main chat endpoint"""
-    try:
-        # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
+    def batch_evaluate(self, evaluation_data: List[Dict], 
+                      save_results: bool = True,
+                      output_file: str = "rag_evaluation_results.json") -> List[EvaluationMetrics]:
+        """
+        Evaluate multiple question-answer pairs in batch
         
-        # Get response from chatbot
-        response, is_expert, confidence = chatbot.get_answer_with_confidence(
-            request.message, session_id
-        )
+        Args:
+            evaluation_data: List of dicts with 'question', 'generated_answer', 
+                           'retrieved_contexts', and optionally 'reference_answer'
+            save_results: Whether to save results to file
+            output_file: Output file name for results
+            
+        Returns:
+            List of EvaluationMetrics objects
+        """
+        results = []
         
-        return ChatResponse(
-            response=response,
-            session_id=session_id,
-            confidence=confidence,
-            is_expert_knowledge=is_expert,
-            timestamp=datetime.now()
-        )
+        print(f"Starting batch evaluation of {len(evaluation_data)} items...")
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
-
-@app.delete("/session/{session_id}")
-async def clear_session(session_id: str, chatbot: HoneyExpertChatbot = Depends(get_chatbot)):
-    """Clear a specific session"""
-    try:
-        chatbot.clear_session_memory(session_id)
-        return {"message": f"Session {session_id} cleared successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error clearing session: {str(e)}")
-
-@app.get("/session/{session_id}", response_model=SessionInfo)
-async def get_session_info(session_id: str, chatbot: HoneyExpertChatbot = Depends(get_chatbot)):
-    """Get session information"""
-    try:
-        session_info = chatbot.get_session_info(session_id)
-        if not session_info:
-            raise HTTPException(status_code=404, detail="Session not found")
+        for i, item in enumerate(evaluation_data):
+            if self.debug or (i + 1) % 10 == 0:
+                print(f"Evaluating item {i + 1}/{len(evaluation_data)}")
+            
+            try:
+                metrics = self.comprehensive_evaluate(
+                    question=item.get('question', ''),
+                    generated_answer=item.get('generated_answer', ''),
+                    retrieved_contexts=item.get('retrieved_contexts', []),
+                    reference_answer=item.get('reference_answer')
+                )
+                results.append(metrics)
+                
+            except Exception as e:
+                print(f"Error evaluating item {i + 1}: {e}")
+                continue
         
-        return SessionInfo(
-            session_id=session_id,
-            message_count=session_info["message_count"],
-            created_at=session_info["created_at"],
-            last_activity=session_info["last_activity"]
-        )
+        if save_results and results:
+            self.save_results(results, output_file)
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting session info: {str(e)}")
+        return results
+    
+    def save_results(self, results: List[EvaluationMetrics], filename: str):
+        """Save evaluation results to JSON file"""
+        try:
+            results_dict = [result.to_dict() for result in results]
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(results_dict, f, indent=2, ensure_ascii=False)
+            
+            print(f"Results saved to {filename}")
+            
+        except Exception as e:
+            print(f"Error saving results: {e}")
+    
+    def generate_report(self, results: List[EvaluationMetrics]) -> Dict[str, Any]:
+        """Generate comprehensive evaluation report"""
+        if not results:
+            return {"error": "No results to analyze"}
+        
+        # Calculate aggregate statistics
+        metrics_stats = {}
+        metric_names = [
+            'semantic_similarity', 'factual_accuracy', 'answer_relevance',
+            'completeness', 'clarity', 'coherence', 'context_adherence',
+            'hallucination_score', 'knowledge_base_alignment',
+            'context_precision', 'context_recall', 'retrieval_quality',
+            'accuracy_score', 'quality_score', 'conformity_score', 'overall_score'
+        ]
+        
+        for metric in metric_names:
+            values = [getattr(result, metric) for result in results if hasattr(result, metric)]
+            if values:
+                metrics_stats[metric] = {
+                    'mean': statistics.mean(values),
+                    'median': statistics.median(values),
+                    'std': statistics.stdev(values) if len(values) > 1 else 0.0,
+                    'min': min(values),
+                    'max': max(values)
+                }
+        
+        # Confidence level distribution
+        confidence_dist = Counter([result.confidence_level for result in results])
+        
+        # Performance categories
+        high_performers = [r for r in results if r.overall_score >= 0.8]
+        low_performers = [r for r in results if r.overall_score < 0.5]
+        
+        report = {
+            'summary': {
+                'total_evaluations': len(results),
+                'average_overall_score': metrics_stats.get('overall_score', {}).get('mean', 0.0),
+                'confidence_distribution': dict(confidence_dist),
+                'high_performers': len(high_performers),
+                'low_performers': len(low_performers)
+            },
+            'detailed_metrics': metrics_stats,
+            'recommendations': self._generate_recommendations(results)
+        }
+        
+        return report
+    
+    def _generate_recommendations(self, results: List[EvaluationMetrics]) -> List[str]:
+        """Generate improvement recommendations based on evaluation results"""
+        recommendations = []
+        
+        if not results:
+            return recommendations
+        
+        # Calculate average scores
+        avg_factual = statistics.mean([r.factual_accuracy for r in results])
+        avg_coherence = statistics.mean([r.coherence for r in results])
+        avg_completeness = statistics.mean([r.completeness for r in results])
+        avg_hallucination = statistics.mean([r.hallucination_score for r in results])
+        avg_context_adherence = statistics.mean([r.context_adherence for r in results])
+        
+        if avg_factual < 0.6:
+            recommendations.append("Improve factual accuracy by enhancing knowledge base quality and fact-checking mechanisms")
+        
+        if avg_coherence < 0.6:
+            recommendations.append("Enhance response coherence through better prompt engineering and response structure")
+        
+        if avg_completeness < 0.6:
+            recommendations.append("Improve answer completeness by retrieving more relevant contexts and better synthesis")
+        
+        if avg_hallucination > 0.4:
+            recommendations.append("Reduce hallucinations by strengthening context adherence and limiting creative responses")
+        
+        if avg_context_adherence < 0.6:
+            recommendations.append("Improve context adherence through better prompt templates and stricter instructions")
+        
+        return recommendations
 
-@app.get("/sessions", response_model=List[str])
-async def list_sessions(chatbot: HoneyExpertChatbot = Depends(get_chatbot)):
-    """List all active sessions"""
-    try:
-        return chatbot.list_sessions()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing sessions: {str(e)}")
+# Convenience functions for easy integration
+def quick_evaluate(llm: ChatGroq, question: str, answer: str, 
+                  contexts: List[str], reference: str = None) -> EvaluationMetrics:
+    """Quick evaluation function for single question-answer pair"""
+    evaluator = RAGEvaluator(llm)
+    return evaluator.comprehensive_evaluate(question, answer, contexts, reference)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def create_test_set(jsonl_data: List[Dict], num_samples: int = 50) -> List[Dict]:
+    """Create test set from JSONL knowledge base for evaluation"""
+    import random
+    
+    # Sample questions from knowledge base
+    samples = random.sample(jsonl_data, min(num_samples, len(jsonl_data)))
+    
+    test_set = []
+    for sample in samples:
+        test_item = {
+            'question': sample.get('instruction', ''),
+            'reference_answer': sample.get('output', ''),
+            'reference_context': sample.get('input', '')
+        }
+        test_set.append(test_item)
+    
+    return test_set

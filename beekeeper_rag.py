@@ -5,14 +5,17 @@ from typing import List, Dict, Tuple, Optional
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import ConversationalRetrievalChain
 from pinecone import Pinecone, ServerlessSpec
+from rag_evaluator import RAGAnswerEvaluator, integrate_with_chatbot
+from rag_accuracy_evaluator import run_accuracy_evaluation, create_sample_test_questions, RAGAccuracyEvaluator
+from rag_evaluation import evaluate_rag_system
+from rag_evaluation import RAGSystemEvaluator, EvaluationMetrics, evaluate_rag_system
+
 load_dotenv()
 
 class HoneyExpertChatbot:
@@ -20,7 +23,7 @@ class HoneyExpertChatbot:
         self.pinecone_api_key = pinecone_api_key
         self.groq_api_key = groq_api_key
         self.pinecone_environment = pinecone_environment
-        self.similarity_threshold = 0.3  # Threshold for knowledge base confidence
+        self.similarity_threshold = 0.5  # Threshold for knowledge base confidence
         
         # Initialize embeddings
         self.embeddings = HuggingFaceEmbeddings(
@@ -49,7 +52,7 @@ class HoneyExpertChatbot:
         
         # Store individual session memories (for multiple users)
         self.session_memories = {}
-        
+    
     def get_session_memory(self, session_id: str = "default") -> ConversationBufferWindowMemory:
         """Get or create memory for a specific session"""
         if session_id not in self.session_memories:
@@ -60,7 +63,8 @@ class HoneyExpertChatbot:
                 output_key="answer"
             )
         return self.session_memories[session_id]
-    
+    def evaluate_performance(self, ground_truth_jsonl: str, session_id: str = "eval") -> 'EvaluationMetrics':
+       return evaluate_rag_system(self, ground_truth_jsonl, session_id)
     def clear_session_memory(self, session_id: str = "default"):
         """Clear memory for a specific session"""
         if session_id in self.session_memories:
@@ -81,37 +85,37 @@ You are a domain classifier. Determine if the following question is related to h
 
 Question: "{question}"
 
-Answer with only "YES" if the question is about:
-- Honey production, harvesting, or processing
-- Beekeeping practices and techniques
-- Bee biology, behavior, or health
-- Hive management and equipment
+Answer with "YES" ONLY if the question requires specific technical knowledge about:
+- Honey production techniques and processes
+- Beekeeping equipment and tools
+- Bee biology and behavior specific to apiculture  
+- Hive management practices
+- Honey extraction and processing
+- Bee diseases, pests, and treatments
 - Apiary setup and maintenance
-- Bee diseases, pests, or treatments
-- Pollination or bee ecology
-- Honey products (wax, royal jelly, propolis, etc.)
-- honey recipes or culinary uses
-- Honey market trends or economics
-- honey regulations or standards
-- honey history or cultural significance
-- Honey-related research or innovations
-- Beekeeping education or training
-- Beekeeping community or events
-- honey conservation or environmental impact
-- honey sustainability practices
-- honey and agriculture
-- honey and nutrition
-- honey verification or quality
-- honey origins or sourcing
-- honey and health benefits
-- honey and wellness
-- honey production methods or technologies
+- Honey quality assessment
+- Beekeeping seasonal management
+- Commercial honey production
+- Pollination management
+- Queen rearing and breeding
+- Swarm management
+- Honey marketing and business
+- Beekeeping regulations and standards
+- Honey storage and preservation
+- Wax production and processing
+- Royal jelly, propolis, and bee products
+- Beekeeping safety practices
+- Climate and seasonal beekeeping
 
-Answer with only "NO" if the question is about unrelated topics like:
-- Geography, politics, sports, entertainment
-- General science not related to bees
-- Technology, programming, or other industries
-- Personal advice not related to beekeeping
+Answer with "NO" if the question is:
+- General/casual questions about bees or honey
+- Questions that can be answered with common knowledge
+- Simple recipe requests (unless technical honey processing)
+- General health benefits of honey
+- Simple definitions that don't require expert knowledge
+- Non-technical questions
+- Questions about other insects or animals
+- General agriculture not specific to bees
 
 Answer: """
             
@@ -290,7 +294,7 @@ Answer: """
         """Create custom prompt template for honey industry expertise with memory context"""
         template = """
 You are a honey industry expert with deep knowledge of beekeeping, honey production, and related topics.
-You have access to conversation history and can reference previous discussions.
+You MUST base your answer ONLY on the provided context from the knowledge base.
 
 Context from Knowledge Base:
 {context}
@@ -300,16 +304,18 @@ Previous Conversation:
 
 Current Question: {question}
 
-Instructions:
-1. Consider the conversation history when answering - reference previous discussions if relevant
-2. If the context provides relevant information, use it to answer comprehensively
-3. Keep responses concise and practical - avoid overly long explanations
-4. Write in a natural, conversational tone as if you're an experienced beekeeper
-5. Structure your response clearly with practical insights
-6. If referring to something discussed earlier, mention it naturally (e.g., "As we discussed earlier...")
-7. If the context doesn't fully address the question, supplement with general knowledge but keep it brief
+CRITICAL INSTRUCTIONS:
+1. Use ONLY the information provided in the Context from Knowledge Base above
+2. Do NOT add information from general knowledge that isn't in the context
+3. Be direct and concise - avoid phrases like "as we've discussed before" unless there's actual conversation history
+4. Keep responses practical and well-structured
+5. Write in a natural, conversational tone as an experienced beekeeper
+6. If you cannot answer based solely on the provided context, do NOT respond - let the system handle it
+7. Do not make assumptions or add details not present in the context
+8. Answer directly without unnecessary introductions or conclusions
+9. Focus on the essential information from the context
 
-Please provide a helpful, expert-level response:
+Based ONLY on the context provided above, here is my response:
 """
         
         return PromptTemplate(
@@ -320,14 +326,14 @@ Please provide a helpful, expert-level response:
     def create_non_domain_prompt(self):
         """Create prompt for non-honey related questions with memory context"""
         template = """
-You are a honey industry expert chatbot. The user has asked a question that is not related to honey production, beekeeping, or apiculture.
+YYou are a honey industry expert chatbot. The user has asked a question that is not related to honey production, beekeeping, or apiculture.
 
 Previous Conversation:
 {chat_history}
 
 Current Question: {question}
 
-Please respond politely and briefly that you specialize in honey industry topics and redirect them to ask about beekeeping, honey production, or related subjects. If they were discussing honey-related topics earlier, you can reference that. Keep your response short and friendly.
+Respond politely that you specialize in honey industry topics and suggest they ask about beekeeping, honey production, or related subjects. Keep your response brief and friendly. Only reference previous conversations if there's actual relevant chat history.
 
 Your response:
 """
@@ -364,7 +370,11 @@ Your response:
         except Exception as e:
             print(f"Error setting up QA chain: {e}")
             return False
-    
+    def run_accuracy_test(self, groq_api_key: str, custom_questions: List[Dict] = None):
+  
+       print("🧪 Running Accuracy Evaluation...")
+       metrics = run_accuracy_evaluation(self, groq_api_key, custom_questions)
+       return metrics
     def get_answer_with_confidence(self, question: str, session_id: str = "default") -> Tuple[str, bool, float]:
         """Get answer and determine if it's from knowledge base or general LLM"""
         try:
@@ -381,7 +391,7 @@ Your response:
                 
                 # Format chat history for the prompt
                 formatted_history = ""
-                if chat_history:
+                if chat_history and len(chat_history) > 2:
                     for msg in chat_history[-4:]:  # Last 2 exchanges (4 messages)
                         if hasattr(msg, 'content'):
                             role = "Human" if msg.type == "human" else "Assistant"
@@ -400,7 +410,7 @@ Your response:
             
             # Get similar documents with scores for domain-related questions
             docs_with_scores = self.vector_store.similarity_search_with_score(
-                question, k=3
+                question, k=5,
             )
             
             # Check if we have high confidence matches
@@ -418,7 +428,23 @@ Your response:
                 if similarities:
                     max_similarity = max(similarities)
                     has_relevant_context = max_similarity > self.similarity_threshold
+            if not has_relevant_context:
+                no_info_response = (
+    f"I'm not certain about '{question}' specifically. While I can't confirm the details, "
+    f"you might consider consulting with local beekeeping associations or experienced beekeepers in your area. "
+    f"\n\nI can help with topics like:\n"
+    f"• Hive management and seasonal practices\n"
+    f"• Honey harvesting and processing\n"
+    f"• Common bee diseases and treatments\n"
+    f"• Equipment recommendations\n"
+    f"• Queen rearing and swarm management\n\n"
+    f"Feel free to ask about any of these specific areas!"
+)
+                session_memory.chat_memory.add_user_message(question)
+                session_memory.chat_memory.add_ai_message(no_info_response)
             
+                return no_info_response, False, max_similarity
+        
             # Create a temporary conversational chain with session memory
             temp_chain = ConversationalRetrievalChain.from_llm(
                 llm=self.llm,
@@ -434,23 +460,47 @@ Your response:
             # Get answer from conversational chain
             result = temp_chain.invoke({"question": question})
             answer = result["answer"]
-            
-            # Add confidence indicator
-            if has_relevant_context:
-                confidence_note = f"\n\n✅ *Based on expert knowledge from database. (Confidence: {max_similarity:.2f})*"
-            else:
-                confidence_note = f"\n\n⚠️ *Based on general knowledge. Please verify with experts. (Confidence: {max_similarity:.2f})*"
-            
-            final_answer = answer + confidence_note
-            
-            return final_answer, has_relevant_context, max_similarity
-            
+            if len(answer.strip()) < 20 or "I don't have" in answer or "cannot answer" in answer.lower():
+                fallback_response = (
+        f"I'm not certain about the specific details of '{question}'. "
+        f"One possible approach would be to consult beekeeping manuals or reach out to experienced beekeepers. "
+        f"\n\nCould you try asking about a more specific aspect of beekeeping or honey production?"
+    )
+                session_memory.chat_memory.add_user_message(question)
+                session_memory.chat_memory.add_ai_message(fallback_response)
+                return fallback_response, False, max_similarity
+           
+            # Only add confidence note if we actually have a good answer from knowledge base
+            #confidence_note = f"\n\n✅ *Expert knowledge validated (Confidence: {max_similarity:.2f})*"
+            final_answer = answer
+        
+            return final_answer, True, max_similarity
+
         except Exception as e:
             error_msg = f"Sorry, I encountered an error: {str(e)}\n\n⚠️ *Please try rephrasing your question.*"
             import traceback
             traceback.print_exc()
             return error_msg, False, 0.0
+    def get_answer_with_confidence_with_eval(self, question: str, session_id: str = "default", evaluator=None):
+        answer, from_kb, confidence = self.get_answer_with_confidence(question, session_id)
+        if evaluator and from_kb:
+            try:
+                docs_with_scores = self.vector_store.similarity_search_with_score(question, k=3)
+                contexts = [doc.page_content for doc, score in docs_with_scores]
+                eval_result = evaluator.comprehensive_evaluation(
+                question=question,
+                answer=answer,
+                retrieved_contexts=contexts,
+                confidence_score=confidence,
+                from_knowledge_base=from_kb
+            )
+                print(f"Faithfulness: {eval_result['faithfulness_score']}/5")
+                print(f"Hallucination detected: {eval_result['hallucination_detected']}")
+            
+            except Exception as e:
+              print(f"Evaluation error: {e}")
     
+        return answer, from_kb, confidence
     def chat_interface(self, message: str, history: List[Dict], session_id: str = "default") -> Tuple[str, List[Dict]]:
         """Main chat interface function with memory"""
         if not message.strip():
@@ -833,8 +883,103 @@ def create_gradio_interface(chatbot):
        <div style="color: #9ca3af; font-size: 10px; text-align: right;">
         ✅ Expert Knowledge | ⚠️ General AI
          </div> """)
- 
-        
+            with gr.Accordion("🧪 Accuracy Evaluation", open=False):
+                with gr.Row():
+                   eval_btn = gr.Button("Run Accuracy Test", variant="secondary")
+                   eval_output = gr.Textbox(
+                    label="Evaluation Results",
+                    lines=10,
+                    placeholder="Click 'Run Accuracy Test' to evaluate system performance"
+                )
+            
+                def run_evaluation():
+                    try:
+                        groq_api_key=os.getenv("GROQ_API_KEY")
+                        metrics = run_accuracy_evaluation(chatbot, groq_api_key)
+                    
+                        result = f"""
+🎯 ACCURACY EVALUATION RESULTS
+================================
+Overall Accuracy: {metrics.overall_accuracy:.1%}
+Correct Answers: {metrics.correct_answers}/{metrics.total_questions}
+
+📊 Detailed Scores:
+• Factual Accuracy: {metrics.factual_accuracy:.1%}
+• Grounding Accuracy: {metrics.grounding_accuracy:.1%}
+• Relevance Accuracy: {metrics.relevance_accuracy:.1%}
+
+Status: {'✅ EXCELLENT' if metrics.overall_accuracy >= 0.8 else '⚠️ GOOD' if metrics.overall_accuracy >= 0.6 else '❌ NEEDS IMPROVEMENT'}
+"""
+                        return result
+                    except Exception as e:
+                       return f"❌ Evaluation failed: {str(e)}"
+            
+                eval_btn.click(run_evaluation, outputs=eval_output)
+            # Replace the existing evaluation accordion with this:
+            with gr.Accordion("🧪 RAG System Evaluation", open=False):
+                with gr.Row():
+                    eval_btn = gr.Button("Run Accuracy Test", variant="secondary")
+                    comprehensive_eval_btn = gr.Button("Run Full RAG Evaluation", variant="primary")
+    
+                eval_output = gr.Textbox(
+        label="Evaluation Results",
+        lines=15,
+        placeholder="Click evaluation buttons to test system performance"
+    )
+    
+                def run_evaluation():
+                    try:
+                        groq_api_key = os.getenv("GROQ_API_KEY")
+                        metrics = run_accuracy_evaluation(chatbot, groq_api_key)
+            
+                        result = f"""
+🎯 ACCURACY EVALUATION RESULTS
+================================
+Overall Accuracy: {metrics.overall_accuracy:.1%}
+Correct Answers: {metrics.correct_answers}/{metrics.total_questions}
+
+📊 Detailed Scores:
+- Factual Accuracy: {metrics.factual_accuracy:.1%}
+- Grounding Accuracy: {metrics.grounding_accuracy:.1%}
+- Relevance Accuracy: {metrics.relevance_accuracy:.1%}
+
+Status: {'✅ EXCELLENT' if metrics.overall_accuracy >= 0.8 else '⚠️ GOOD' if metrics.overall_accuracy >= 0.6 else '❌ NEEDS IMPROVEMENT'}
+"""
+                        return result
+                    except Exception as e:
+                        return f"❌ Evaluation failed: {str(e)}"
+    
+                def run_comprehensive_evaluation():
+                    try:
+            # This uses your ground truth JSONL file for comprehensive evaluation
+                     ground_truth_file = "beekeeping_data_eval.jsonl"  # Update this path
+                     metrics = chatbot.evaluate_performance(ground_truth_file)
+            
+                     result = f"""
+🔬 COMPREHENSIVE RAG EVALUATION
+=================================
+Total Questions Evaluated: {metrics.total_questions}
+
+📊 Core Metrics:
+- Exact Match Score: {metrics.exact_match:.1%}
+- F1 Score: {metrics.f1_score:.1%}
+- Semantic Similarity: {metrics.semantic_similarity:.1%}
+- Entailment Accuracy: {metrics.entailment_accuracy:.1%}
+
+📈 Performance Assessment:
+- Excellent (>80%): {'✅' if metrics.f1_score > 0.8 else '❌'} F1 Score
+- Good Semantic Match: {'✅' if metrics.semantic_similarity > 0.7 else '❌'} Similarity
+- Factual Consistency: {'✅' if metrics.entailment_accuracy > 0.6 else '❌'} Entailment
+
+🎯 Overall System Health: {'🟢 EXCELLENT' if metrics.f1_score > 0.8 else '🟡 GOOD' if metrics.f1_score > 0.6 else '🔴 NEEDS IMPROVEMENT'}
+"""
+                     return result
+                    except Exception as e:
+                      return f"❌ Comprehensive evaluation failed: {str(e)}"
+    
+    # Wire up the buttons
+        eval_btn.click(run_evaluation, outputs=eval_output)
+        comprehensive_eval_btn.click(run_comprehensive_evaluation, outputs=eval_output)
         # Event handlers with WhatsApp-like experience
         def respond(message, history):
             if not message.strip():
@@ -877,9 +1022,11 @@ def main():
     if not setup_chatbot_efficiently(chatbot, JSONL_FILE_PATH, force_upload=False):
         print("Failed to setup chatbot. Please check your data file and API keys.")
         return
-    
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    evaluator = RAGAnswerEvaluator(GROQ_API_KEY)
+    chatbot_with_eval = integrate_with_chatbot(chatbot, evaluator)
     # Create and launch Gradio interface
-    interface = create_gradio_interface(chatbot)
+    interface = create_gradio_interface(chatbot_with_eval)
     
     print("Launching Honey Industry Expert Chatbot with Memory...")
     interface.launch(
